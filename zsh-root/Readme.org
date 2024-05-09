@@ -1,0 +1,182 @@
+* Nixos Minimal Install Root ZFS
+ This documentation shows how I install a NixOS fully on ZFS. I will be using a virtual host for this install but the same concepts will apply for any install.
+ 
+* Resources
+** [[https://nixos.wiki/wiki/ZFS]] 
+This document pulls alot of the commands from the link above.
+** [[https://openzfs.github.io/openzfs-docs/Getting%20Started/NixOS/Root%20on%20ZFS.html]]
+
+* System Recommendations 
+** NixOS installation ISO or bootable image. 
+*** [[https://nixos.org/download/][NixOS Download]] I use nixos-minimal-23.11.6981.27c13997bf45-x86_64-linux.iso for this video.
+** Memory
+*** 4G+
+** Storage
+NixOS likes storage for /nix so I normally like to have 100G of useable storage for my installs. However, I will be using a 50G disk for this example. 
+** Virtual machine installs
+*** Ensure you enable EFI
+
+* Installation
+** Boot using the NixOS install image and Choose the first Option from the boot menu.
+** Sudo -i and set root password
+** SSH to the host as root
+#+begin_src bash
+ssh root@"Your Host IP"
+#+end_src
+** Locate your disk you would like to use for your zpool.
+#+begin_src bash
+find /dev/disk/by-id/
+#+end_src
+** Create Disk Partitions
+For all commands below replace /dev/disk/by-id/ata-VBOX_HARDDISK_VBcfded485-dc371b66 with your disk from the command above.
+*** Create an EFI boot and zfs partition
+#+begin_src bash
+fdisk /dev/disk/by-id/ata-VBOX_HARDDISK_VBcfded485-dc371b66
+...
+Command (m for help): p
+Disk /dev/disk/by-id/ata-VBOX_HARDDISK_VBcfded485-dc371b66: 50 GiB, 53687091200 bytes, 104857600 sectors
+Disk model: VBOX HARDDISK
+Units: sectors of 1 * 512 = 512 bytes
+Sector size (logical/physical): 512 bytes / 512 bytes
+I/O size (minimum/optimal): 512 bytes / 512 bytes
+Disklabel type: dos
+Disk identifier: 0x6bad0ec5
+
+Device                                                      Boot   Start       End   Sectors Size Id Type
+/dev/disk/by-id/ata-VBOX_HARDDISK_VBcfded485-dc371b66-part1         2048   2099199   2097152   1G ef EFI (FAT-12/16/32)
+/dev/disk/by-id/ata-VBOX_HARDDISK_VBcfded485-dc371b66-part2      2099200 104857599 102758400  49G 83 Linux
+
+#+end_src
+** Make ZFS pool with encryption and mount points
+*** Create zfs encrypted pool
+Be sure to add the partition name "-part2" on to your disk id. 
+#+begin_src bash
+zpool create -O encryption=on -O keyformat=passphrase -O keylocation=prompt -O compression=on -O mountpoint=none -O xattr=sa -O acltype=posixacl -o ashift=12 zpool /dev/disk/by-id/ata-VBOX_HARDDISK_VBcfded485-dc371b66-part2
+#+end_src
+*** Create mount points
+#+begin_src bash
+[root@nixos:~]# zfs create -o mountpoint=legacy zpool/root
+[root@nixos:~]# zfs create -o mountpoint=legacy zpool/nix
+[root@nixos:~]# zfs create -o mountpoint=legacy zpool/var
+[root@nixos:~]# zfs create -o mountpoint=legacy zpool/home
+ 
+[root@nixos:~]# mkdir /mnt/root
+[root@nixos:~]# mount -t zfs zpool/root /mnt
+[root@nixos:~]# mkdir /mnt/nix /mnt/var /mnt/home
+
+[root@nixos:~]# mount -t zfs zpool/nix /mnt/nix
+[root@nixos:~]# mount -t zfs zpool/var /mnt/var
+[root@nixos:~]# mount -t zfs zpool/home /mnt/home
+#+end_src
+*** Verify zpool creation and mount points
+#+begin_src bash
+[root@nixos:~]# zpool status
+  pool: zpool
+ state: ONLINE
+config:
+
+	NAME                                           STATE     READ WRITE CKSUM
+	zpool                                          ONLINE       0     0     0
+	  ata-VBOX_HARDDISK_VBcfded485-dc371b66-part2  ONLINE       0     0     0
+
+errors: No known data errors
+
+[root@nixos:~]# zfs mount
+zpool/root                      /mnt
+zpool/nix                       /mnt/nix
+zpool/var                       /mnt/var
+zpool/home                      /mnt/home
+#+end_src
+*** Create fat filesystem on boot partition
+#+begin_src bash
+[root@nixos:~]# mkfs.fat -F 32 -n boot /dev/disk/by-id/ata-VBOX_HARDDISK_VBcfded485-dc371b66-part1
+mkfs.fat 4.2 (2021-01-31)
+mkfs.fat: Warning: lowercase labels might not work properly on some systems
+#+end_src
+*** Mount boot partition
+#+begin_src bash
+[root@nixos:~]# mkdir -p /mnt/boot
+[root@nixos:~]# mount /dev/disk/by-label/boot /mnt/boot
+#+end_src
+** Generate NixOS configs in /mnt
+#+begin_src bash
+[root@nixos:~]#  nixos-generate-config --root /mnt
+writing /mnt/etc/nixos/hardware-configuration.nix...
+writing /mnt/etc/nixos/configuration.nix...
+For more hardware-specific settings, see https://github.com/NixOS/nixos-hardware.
+#+end_src
+** Modify /mnt/etc/nixos/configuration.nix
+Note: Remove / comment out boot.loader.systemd-boot.enable = true; and boot.loader.efi.canTouchEfiVariables = true; config if added bynixos-generate-config. 
+Note: The boot device can be found by running ls -l /deb/disk/by-uuid/.
+*** Add the following to configuration.nix
+#+begin_src text
+# Boot loader config for configuration.nix:
+  boot.loader.grub = {
+    enable = true;
+    zfsSupport = true;
+    efiSupport = true;
+    efiInstallAsRemovable = true;
+    mirroredBoots = [
+      { devices = [ "nodev"]; path = "/boot"; }
+    ];
+  };
+  
+  networking.hostId = "13d83f98";
+
+# Import zpool on boot
+  boot.zfs.extraPools = [ "zpool" ];
+
+  fileSystems."/" =
+    { device = "zpool/root";
+      fsType = "zfs";
+    };
+
+  fileSystems."/nix" =
+    { device = "zpool/nix";
+      fsType = "zfs";
+    };
+
+  fileSystems."/var" =
+    { device = "zpool/var";
+      fsType = "zfs";
+    };
+
+  fileSystems."/home" =
+    { device = "zpool/home";
+      fsType = "zfs";
+    };
+
+  fileSystems."/boot" =
+    { device = "/dev/disk/by-uuid/7981-A436"; 
+      fsType = "vfat";
+    };
+
+  swapDevices = [ ];
+  
+#+end_src
+** Add the following to /mnt/etc/nixos/hardware-configuration.nix
+I am aware hardware-configuration.nix tells you to not edit this file however the nix installer does not write to the boot partition with out adding the config below.
+#+begin_src text
+  fileSystems."/boot" =
+    { device = "/dev/disk/by-uuid/7981-A436"; 
+      fsType = "vfat";
+    };
+
+#+end_src
+** Instaill NixOS to /mnt/
+#+begin_src bash
+[root@nixos:~]# nixos-install
+...
+setting up /etc...
+setting root password...
+New password:
+Retype new password:
+passwd: password updated successfully
+installation finished!
+
+[root@nixos:~]#
+#+end_src
+** Reboot and Test install
+#+begin_src bash
+[root@nixos:~]# shutdown -h now
+#+end_src
